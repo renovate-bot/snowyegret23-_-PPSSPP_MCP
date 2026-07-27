@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import time
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from . import background_input
+from . import keyboard_input
 from .debugger_client import PPSSPPDebuggerClient, PPSSPPDebuggerError
 from . import process_memory
 from . import window_capture
@@ -13,6 +17,21 @@ from . import window_capture
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7378
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PSP_BUTTONS = (
+    "up",
+    "down",
+    "left",
+    "right",
+    "start",
+    "select",
+    "ltrigger",
+    "rtrigger",
+    "cross",
+    "circle",
+    "square",
+    "triangle",
+)
 
 mcp = FastMCP("ppsspp-mcp")
 
@@ -27,6 +46,73 @@ def _err(message: str, **kw: Any) -> dict[str, Any]:
 
 def _debugger(host: str, port: int, timeout: float) -> PPSSPPDebuggerClient:
     return PPSSPPDebuggerClient(host=host, port=port, timeout=timeout)
+
+
+def _checked_request(client: PPSSPPDebuggerClient, event: str, **params: Any) -> dict[str, Any]:
+    response = client.request(event, **params)
+    if response.get("event") == "error":
+        raise PPSSPPDebuggerError(str(response.get("message", f"{event} failed")))
+    return response
+
+
+def _connect_native(
+    backend: str,
+    host: str,
+    port: int,
+    timeout: float,
+) -> tuple[PPSSPPDebuggerClient | None, str | None]:
+    requested = backend.strip().lower()
+    if requested not in {"auto", "native", "keyboard", "xinput"}:
+        raise ValueError("backend must be 'auto', 'native', 'keyboard', or 'xinput'")
+    if requested not in {"auto", "native"}:
+        return None, None
+
+    client = _debugger(host, port, timeout)
+    try:
+        client.connect()
+    except (OSError, PPSSPPDebuggerError) as exc:
+        client.close()
+        if requested == "native":
+            raise
+        return None, f"native WebSocket input unavailable: {exc}"
+    return client, None
+
+
+def _fallback_backend(backend: str, native_reason: str | None) -> tuple[str, str | None]:
+    selected, fallback_reason = background_input.choose_backend(backend)
+    reasons = [reason for reason in (native_reason, fallback_reason) if reason]
+    return selected, "; ".join(reasons) if reasons else None
+
+
+def _normalize_buttons(buttons: dict[str, bool | None]) -> dict[str, bool | None]:
+    normalized: dict[str, bool | None] = {}
+    for button, pressed in buttons.items():
+        name = background_input.normalize_button(button)
+        if pressed is not None and not isinstance(pressed, bool):
+            raise ValueError(f"button state for {button!r} must be true, false, or null")
+        normalized[name] = pressed
+    return normalized
+
+
+def _keyboard_window(pid: int | None) -> tuple[dict[str, Any], int]:
+    window = window_capture.find_ppsspp_window(pid)
+    return window, int(window["hwnd"], 16)
+
+
+def _default_screenshot_path() -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return _PROJECT_ROOT / "logs" / "screenshots" / f"ppsspp-{stamp}.png"
+
+
+def _capture_inactive_window(output_path: Path, pid: int | None) -> dict[str, Any]:
+    window = window_capture.find_ppsspp_window(pid)
+    result = window_capture.capture_window(int(window["hwnd"], 16), output_path)
+    return {
+        "pid": window["pid"],
+        "title": window["title"],
+        "class_name": window["class_name"],
+        **result,
+    }
 
 
 def _get_pid(pid: int | None) -> int:
@@ -126,8 +212,10 @@ def pause(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 5
     """Pause PPSSPP emulation through the debugger."""
     try:
         with _debugger(host, port, timeout) as client:
-            client.request("game.pause")
-            return _ok()
+            status = _checked_request(client, "cpu.status")
+            if bool(status.get("stepping", False)):
+                return _ok(response=status, already_stepping=True)
+            return _ok(response=client.request_event("cpu.stepping"))
     except (OSError, PPSSPPDebuggerError) as e:
         return _err(str(e), host=host, port=port)
 
@@ -137,8 +225,10 @@ def resume(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 
     """Resume PPSSPP emulation through the debugger."""
     try:
         with _debugger(host, port, timeout) as client:
-            client.request("game.resume")
-            return _ok()
+            status = _checked_request(client, "cpu.status")
+            if not bool(status.get("stepping", False)):
+                return _ok(response=status, already_running=True)
+            return _ok(response=client.request_event("cpu.resume"))
     except (OSError, PPSSPPDebuggerError) as e:
         return _err(str(e), host=host, port=port)
 
@@ -154,33 +244,309 @@ def debugger_request(event: str, params: dict[str, Any] | None = None, host: str
 
 
 @mcp.tool()
-def input_button_press(button: str, duration: int = 6, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 5.0) -> dict:
-    """Press and release a PSP button through PPSSPP's WebSocket debugger."""
+def input_button_press(
+    button: str,
+    duration: int = 6,
+    backend: str = "auto",
+    pid: int | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 5.0,
+) -> dict:
+    """Press and release a PSP button without activating PPSSPP."""
+    native: PPSSPPDebuggerClient | None = None
     try:
-        with _debugger(host, port, timeout) as client:
-            return _ok(response=client.request("input.buttons.press", button=button, duration=duration))
-    except (OSError, PPSSPPDebuggerError) as e:
-        return _err(str(e), host=host, port=port, button=button)
+        if not 1 <= duration <= 600:
+            raise ValueError("duration must be between 1 and 600 frames")
+        normalized = background_input.normalize_button(button)
+        native, native_reason = _connect_native(backend, host, port, timeout)
+        if native is not None:
+            try:
+                response = _checked_request(
+                    native,
+                    "input.buttons.press",
+                    button=normalized,
+                    duration=duration,
+                )
+            finally:
+                native.close()
+                native = None
+            return _ok(
+                selected_backend="native",
+                response=response,
+                foreground_activation=False,
+            )
+
+        selected, fallback_reason = _fallback_backend(backend, native_reason)
+        duration_ms = max(1, round(duration * 1000 / 60))
+        if selected == "xinput":
+            result = background_input.gamepad.press(normalized, duration_ms)
+            return _ok(
+                selected_backend=selected,
+                fallback_reason=fallback_reason,
+                duration_frames=duration,
+                **result,
+            )
+        window, hwnd = _keyboard_window(pid)
+        result = keyboard_input.keyboard.press(hwnd, normalized, duration_ms)
+        return _ok(
+            selected_backend=selected,
+            fallback_reason=fallback_reason,
+            duration_frames=duration,
+            input_target=window,
+            **result,
+        )
+    except (
+        background_input.BackgroundInputError,
+        OSError,
+        PPSSPPDebuggerError,
+        ValueError,
+    ) as e:
+        return _err(str(e), host=host, port=port, button=button, backend=backend)
+    finally:
+        if native is not None:
+            native.close()
 
 
 @mcp.tool()
-def input_buttons_send(buttons: dict[str, bool | None], host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 5.0) -> dict:
-    """Set PSP button states through PPSSPP's WebSocket debugger."""
+def input_buttons_send(
+    buttons: dict[str, bool | None],
+    backend: str = "auto",
+    pid: int | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 5.0,
+) -> dict:
+    """Set PSP button states without activating PPSSPP."""
+    native: PPSSPPDebuggerClient | None = None
     try:
-        with _debugger(host, port, timeout) as client:
-            return _ok(response=client.request("input.buttons.send", buttons=buttons))
-    except (OSError, PPSSPPDebuggerError) as e:
-        return _err(str(e), host=host, port=port, buttons=buttons)
+        normalized = _normalize_buttons(buttons)
+        native, native_reason = _connect_native(backend, host, port, timeout)
+        if native is not None:
+            try:
+                response = _checked_request(native, "input.buttons.send", buttons=normalized)
+            finally:
+                native.close()
+                native = None
+            return _ok(
+                selected_backend="native",
+                response=response,
+                foreground_activation=False,
+            )
+
+        selected, fallback_reason = _fallback_backend(backend, native_reason)
+        if selected == "xinput":
+            result = background_input.gamepad.set_buttons(normalized)
+            return _ok(
+                selected_backend=selected,
+                fallback_reason=fallback_reason,
+                **result,
+            )
+        window, hwnd = _keyboard_window(pid)
+        result = keyboard_input.keyboard.set_buttons(hwnd, normalized)
+        return _ok(
+            selected_backend=selected,
+            fallback_reason=fallback_reason,
+            input_target=window,
+            **result,
+        )
+    except (
+        background_input.BackgroundInputError,
+        OSError,
+        PPSSPPDebuggerError,
+        ValueError,
+    ) as e:
+        return _err(str(e), host=host, port=port, buttons=buttons, backend=backend)
+    finally:
+        if native is not None:
+            native.close()
 
 
 @mcp.tool()
-def input_analog_send(x: float, y: float, stick: str = "left", host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 5.0) -> dict:
-    """Set PSP analog stick coordinates through PPSSPP's WebSocket debugger."""
+def input_analog_send(
+    x: float,
+    y: float,
+    stick: str = "left",
+    backend: str = "auto",
+    pid: int | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 5.0,
+) -> dict:
+    """Set PSP analog coordinates without activating PPSSPP."""
+    native: PPSSPPDebuggerClient | None = None
     try:
-        with _debugger(host, port, timeout) as client:
-            return _ok(response=client.request("input.analog.send", x=x, y=y, stick=stick))
+        side = stick.strip().lower()
+        if side not in {"left", "right"}:
+            raise ValueError("stick must be 'left' or 'right'")
+        if not -1.0 <= x <= 1.0 or not -1.0 <= y <= 1.0:
+            raise ValueError("x and y must be between -1.0 and 1.0")
+        native, native_reason = _connect_native(backend, host, port, timeout)
+        if native is not None:
+            try:
+                response = _checked_request(
+                    native,
+                    "input.analog.send",
+                    x=float(x),
+                    y=float(y),
+                    stick=side,
+                )
+            finally:
+                native.close()
+                native = None
+            return _ok(
+                selected_backend="native",
+                response=response,
+                foreground_activation=False,
+            )
+
+        selected, fallback_reason = _fallback_backend(backend, native_reason)
+        if selected == "xinput":
+            result = background_input.gamepad.set_analog(x, y, side)
+            return _ok(
+                selected_backend=selected,
+                fallback_reason=fallback_reason,
+                **result,
+            )
+        window, hwnd = _keyboard_window(pid)
+        result = keyboard_input.keyboard.set_analog(hwnd, x, y, side)
+        return _ok(
+            selected_backend=selected,
+            fallback_reason=fallback_reason,
+            input_target=window,
+            **result,
+        )
+    except (
+        background_input.BackgroundInputError,
+        OSError,
+        PPSSPPDebuggerError,
+        ValueError,
+    ) as e:
+        return _err(str(e), host=host, port=port, x=x, y=y, stick=stick, backend=backend)
+    finally:
+        if native is not None:
+            native.close()
+
+
+@mcp.tool()
+def input_reset(
+    backend: str = "auto",
+    pid: int | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 5.0,
+) -> dict:
+    """Release native, keyboard, and virtual-controller input without focus."""
+    native: PPSSPPDebuggerClient | None = None
+    try:
+        requested = backend.strip().lower()
+        native, native_reason = _connect_native(requested, host, port, timeout)
+        if native is not None:
+            try:
+                button_response = _checked_request(
+                    native,
+                    "input.buttons.send",
+                    buttons={button: False for button in _PSP_BUTTONS},
+                )
+                analog_responses = [
+                    _checked_request(native, "input.analog.send", x=0.0, y=0.0, stick=stick)
+                    for stick in ("left", "right")
+                ]
+            finally:
+                native.close()
+                native = None
+            if requested == "native":
+                return _ok(
+                    selected_backend="native",
+                    buttons=button_response,
+                    analog=analog_responses,
+                    foreground_activation=False,
+                )
+        else:
+            button_response = None
+            analog_responses = None
+
+        if requested == "xinput":
+            return _ok(selected_backend="xinput", **background_input.gamepad.reset())
+
+        keyboard_result = None
+        input_window = None
+        if requested in {"auto", "keyboard"}:
+            try:
+                input_window, hwnd = _keyboard_window(pid)
+                keyboard_result = keyboard_input.keyboard.reset(hwnd)
+            except (OSError, ValueError):
+                if requested == "keyboard":
+                    raise
+
+        xinput_result = (
+            background_input.gamepad.reset()
+            if requested == "auto" and background_input.gamepad.status()["connected"]
+            else None
+        )
+        return _ok(
+            native=button_response,
+            native_analog=analog_responses,
+            native_fallback_reason=native_reason,
+            keyboard=keyboard_result,
+            xinput=xinput_result,
+            input_target=input_window,
+            foreground_activation=False,
+        )
+    except (
+        background_input.BackgroundInputError,
+        OSError,
+        PPSSPPDebuggerError,
+        ValueError,
+    ) as e:
+        return _err(str(e), host=host, port=port, backend=backend)
+    finally:
+        if native is not None:
+            native.close()
+
+
+@mcp.tool()
+def configure_background_input(config_path: str | None = None) -> dict:
+    """Keep PPSSPP running and accepting gamepad input while inactive."""
+    try:
+        return _ok(**background_input.configure_background_input(config_path))
+    except (OSError, ValueError) as e:
+        return _err(str(e), config_path=config_path)
+
+
+@mcp.tool()
+def background_input_status(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 0.5,
+) -> dict:
+    """Return native, XInput, and patched-keyboard backend availability."""
+    native_available = False
+    native_error = None
+    client = _debugger(host, port, timeout)
+    try:
+        client.connect()
+        native_available = True
     except (OSError, PPSSPPDebuggerError) as e:
-        return _err(str(e), host=host, port=port, x=x, y=y, stick=stick)
+        native_error = str(e)
+    finally:
+        client.close()
+    return _ok(
+        default_backend="auto",
+        auto_order=["native", "xinput", "keyboard"],
+        native={
+            "available": native_available,
+            "backend": "PPSSPP WebSocket debugger",
+            "error": native_error,
+        },
+        xinput_module_available=background_input.xinput_module_available(),
+        xinput=background_input.gamepad.status(),
+        keyboard={
+            "backend": "PPSSPP.MCP.BackgroundKey",
+            "requires_patched_build": True,
+        },
+        foreground_activation=False,
+    )
 
 
 @mcp.tool()
@@ -200,15 +566,81 @@ def list_ppsspp_windows(pid: int | None = None) -> dict:
 
 
 @mcp.tool()
-def capture_ppsspp_window(output_path: str | None = None, pid: int | None = None, restore: bool = True) -> dict:
-    """Capture the PPSSPP window with PrintWindow, even when it is inactive or covered."""
+def take_screenshot(
+    output_path: str | None = None,
+    pid: int | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 15.0,
+) -> dict:
+    """Capture the rendered PSP frame natively, with inactive PrintWindow fallback."""
     try:
-        window = window_capture.find_ppsspp_window(pid)
+        out = _default_screenshot_path() if output_path is None else Path(output_path)
+        if not out.is_absolute():
+            out = Path.cwd() / out
+        out = out.resolve()
+        if out.suffix.lower() != ".png":
+            raise ValueError("PPSSPP screenshots require a .png output path")
+
+        native_error = None
+        try:
+            with _debugger(host, port, timeout) as client:
+                status = _checked_request(client, "cpu.status")
+                resume_after_capture = not bool(status.get("stepping", False))
+                if resume_after_capture:
+                    client.request_event("cpu.stepping")
+                try:
+                    response = _checked_request(client, "gpu.buffer.screenshot", type="uri")
+                finally:
+                    if resume_after_capture:
+                        client.request_event("cpu.resume")
+            uri = response.get("uri")
+            if not isinstance(uri, str):
+                raise PPSSPPDebuggerError("gpu.buffer.screenshot returned no PNG data URI")
+            header, separator, payload = uri.partition(",")
+            if separator != "," or header != "data:image/png;base64":
+                raise PPSSPPDebuggerError("gpu.buffer.screenshot returned an unsupported data URI")
+            data = base64.b64decode(payload, validate=True)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            return _ok(
+                output_path=str(out),
+                size=len(data),
+                width=response.get("width"),
+                height=response.get("height"),
+                is_framebuffer=bool(response.get("isFramebuffer", False)),
+                method="gpu.buffer.screenshot",
+                foreground_activation=False,
+            )
+        except (binascii.Error, OSError, PPSSPPDebuggerError, ValueError) as e:
+            native_error = str(e)
+
+        result = _capture_inactive_window(out, pid)
+        return _ok(
+            **result,
+            native_error=native_error,
+            fallback="inactive-window",
+            foreground_activation=False,
+        )
+    except (OSError, ValueError, RuntimeError) as e:
+        return _err(
+            str(e),
+            pid=pid,
+            output_path=output_path,
+            host=host,
+            port=port,
+        )
+
+
+@mcp.tool()
+def capture_ppsspp_window(output_path: str | None = None, pid: int | None = None) -> dict:
+    """Capture an inactive PPSSPP window without restoring or activating it."""
+    try:
         out = window_capture.default_output_path() if output_path is None else Path(output_path)
         if not out.is_absolute():
             out = Path.cwd() / out
-        result = window_capture.capture_window(int(window["hwnd"], 16), out, restore=restore)
-        return _ok(pid=window["pid"], title=window["title"], class_name=window["class_name"], **result)
+        result = _capture_inactive_window(out.resolve(), pid)
+        return _ok(**result, foreground_activation=False)
     except (OSError, ValueError, RuntimeError) as e:
         return _err(str(e), pid=pid, output_path=output_path)
 

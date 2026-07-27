@@ -74,6 +74,20 @@ class PPSSPPDebuggerClient:
     def notify(self, event: str, **params: Any) -> None:
         self.send({"event": event, **params})
 
+    def request_event(self, event: str, **params: Any) -> dict[str, Any]:
+        """Send a request whose asynchronous response does not echo tickets."""
+        self.notify(event, **params)
+        deadline = time.monotonic() + self.timeout
+        last_event: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            message = self.recv_json()
+            last_event = message
+            if message.get("event") == "error":
+                raise PPSSPPDebuggerError(str(message.get("message", f"{event} failed")))
+            if message.get("event") == event:
+                return message
+        raise PPSSPPDebuggerError(f"timed out waiting for event {event}; last_event={last_event!r}")
+
     def send(self, payload: dict[str, Any]) -> None:
         self.connect()
         raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")

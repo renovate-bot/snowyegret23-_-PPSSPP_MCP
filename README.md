@@ -5,7 +5,7 @@
 PPSSPP MCP is a Windows-focused Model Context Protocol server for controlling and inspecting [PPSSPP](https://www.ppsspp.org/). It combines PPSSPP's WebSocket remote debugger with Windows process-memory inspection, input automation, process launching, and inactive-window screenshots.
 
 > [!IMPORTANT]
-> Debugger and input tools require PPSSPP's remote debugger to be enabled and a game to be loaded. Windows process-memory and window-capture tools operate locally on the PPSSPP process and are separate from the remote debugger connection.
+> Native debugger input and rendered-frame capture require PPSSPP's remote debugger to be enabled and a game to be loaded. XInput and patched-keyboard input, Windows process-memory inspection, and inactive-window capture operate locally.
 
 ## Features
 
@@ -14,6 +14,7 @@ PPSSPP MCP is a Windows-focused Model Context Protocol server for controlling an
 - Evaluate debugger expressions and disassemble PSP code.
 - Send raw PPSSPP debugger events for advanced operations.
 - Press digital buttons, set multiple button states, and send analog-stick input.
+- Fall back from native WebSocket input to optional XInput and then patched background keyboard input.
 - Discover and launch PPSSPP processes.
 - Enumerate PPSSPP windows and capture inactive windows to an image file.
 - List Windows virtual-memory regions for a PPSSPP process.
@@ -41,6 +42,12 @@ Open PowerShell in the repository directory:
 
 ```powershell
 python -m pip install -e .
+```
+
+Optional ViGEm/XInput support:
+
+```powershell
+python -m pip install -e ".[xinput]"
 ```
 
 Run the server directly:
@@ -76,7 +83,9 @@ The `python` command must resolve to the interpreter where the project dependenc
 5. Use `input_button_press`, `input_buttons_send`, or `input_analog_send` for input automation.
 6. Call `resume` when inspection is complete.
 
-For visual inspection, use `list_ppsspp_windows` and then `capture_ppsspp_window`. The capture tool can temporarily restore a minimized window and return it to its prior state.
+For visual inspection, prefer `take_screenshot`, which briefly enters debugger stepping, reads the rendered frame through PPSSPP's WebSocket debugger, and restores the prior running state. Its fallback and `capture_ppsspp_window` use `PrintWindow` without restoring, activating, or focusing PPSSPP.
+
+Input tools accept `backend="auto"`, `"native"`, `"xinput"`, or `"keyboard"`. `auto` tries the WebSocket debugger first, then optional ViGEm/XInput, and finally the `PPSSPP.MCP.BackgroundKey` message supported by the patched PPSSPP build. Run `configure_background_input` once to disable pause-on-focus-loss and focused-gamepad-only behavior. The keyboard path never calls a foreground-window API.
 
 For host process-memory inspection, use `list_ppsspp_processes`, `list_process_regions`, and `find_process_pattern` before calling `read_process_memory` with a Windows virtual address.
 
@@ -88,7 +97,8 @@ For host process-memory inspection, use `list_ppsspp_processes`, `list_process_r
 | Code inspection | `evaluate`, `disassemble` |
 | Execution | `pause`, `resume` |
 | Advanced protocol | `debugger_request` |
-| Input | `input_button_press`, `input_buttons_send`, `input_analog_send` |
+| Input | `input_button_press`, `input_buttons_send`, `input_analog_send`, `input_reset` |
+| Background setup | `configure_background_input`, `background_input_status` |
 
 `debugger_request` sends a raw event and parameter object to PPSSPP. Prefer the dedicated tools when one exists, and use raw requests only when the event contract is known.
 
@@ -97,7 +107,7 @@ For host process-memory inspection, use `list_ppsspp_processes`, `list_process_r
 | Area | Tools |
 | --- | --- |
 | Process control | `list_ppsspp_processes`, `launch_ppsspp` |
-| Window capture | `list_ppsspp_windows`, `capture_ppsspp_window` |
+| Capture | `take_screenshot`, `list_ppsspp_windows`, `capture_ppsspp_window` |
 | Memory regions | `list_process_regions` |
 | Memory access | `read_process_memory`, `find_process_pattern`, `pattern_from_text` |
 

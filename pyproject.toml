@@ -8,6 +8,11 @@ dependencies = [
     "psutil>=5.9",
 ]
 
+[project.optional-dependencies]
+xinput = [
+    "vgamepad==0.1.0",
+]
+
 [project.scripts]
 ppsspp-mcp = "ppsspp_mcp.__main__:main"
 

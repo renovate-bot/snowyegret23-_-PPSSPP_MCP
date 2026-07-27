@@ -55,8 +55,6 @@ user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int
 user32.GetClassNameW.restype = ctypes.c_int
 user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = ctypes.c_bool
-user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-user32.ShowWindow.restype = ctypes.c_bool
 user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 user32.PrintWindow.restype = ctypes.c_bool
 
@@ -102,7 +100,6 @@ ole32.CLSIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(GUID)]
 ole32.CLSIDFromString.restype = ctypes.c_long
 
 
-SW_RESTORE = 9
 PW_RENDERFULLCONTENT = 0x00000002
 PNG_ENCODER_CLSID = "{557CF406-1A04-11D3-9A73-0000F81EF32E}"
 
@@ -206,10 +203,7 @@ def _save_hbitmap_png(hbitmap: int, output_path: Path) -> None:
         gdiplus.GdiplusShutdown(token)
 
 
-def capture_window(hwnd: int, output_path: Path, restore: bool = True) -> dict[str, Any]:
-    if restore:
-        user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
-        time.sleep(0.2)
+def capture_window(hwnd: int, output_path: Path) -> dict[str, Any]:
     rect = _rect(hwnd)
     width = rect.right - rect.left
     height = rect.bottom - rect.top
