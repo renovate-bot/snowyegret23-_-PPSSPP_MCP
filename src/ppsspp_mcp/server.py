@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from . import background_input
 from . import keyboard_input
@@ -33,7 +33,7 @@ _PSP_BUTTONS = (
     "triangle",
 )
 
-mcp = FastMCP("ppsspp-mcp")
+mcp = MCPServer("ppsspp-mcp")
 
 
 def _ok(**kw: Any) -> dict[str, Any]:
